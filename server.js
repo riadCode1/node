@@ -111,14 +111,14 @@ app.post('/api/auth/qf/refresh', authLimiter, async (req, res) => {
 });
 
 // ── Step 4: Proxy QF User API calls ───────────────────────────
-app.all('/api/qf/*', async (req, res) => {
+app.all('/api/qf/*path', async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'No token provided' });
   }
 
   const accessToken = authHeader.split(' ')[1];
-  const qfPath = req.path.replace('/api/qf', '');
+  const qfPath = '/' + req.params.path;  // ← use params.path instead of req.path
 
   try {
     const { data, status } = await axios({
