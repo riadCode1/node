@@ -184,3 +184,9 @@ app.listen(PORT, () => {
   console.log(`   Auth base: ${AUTH_BASE}`);
   console.log(`   Redirect:  ${QF_REDIRECT_URI}`);
 });
+app.get("/oauth/callback", (req, res) => {
+  res.send(`
+    <h2>✅ Auth complete</h2>
+    <p>You can close this tab and return to the app.</p>
+  `);
+});
