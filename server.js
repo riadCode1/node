@@ -1,150 +1,186 @@
+/**
+ * backend/server.js — Quran Foundation OAuth2 Backend
+ *
+ * This server keeps CLIENT_SECRET off the mobile device.
+ * It performs:
+ *   POST /api/auth/qf/exchange  — code + code_verifier → tokens
+ *   POST /api/auth/qf/refresh   — refresh_token → new tokens
+ *   POST /api/auth/qf/logout    — revoke refresh_token
+ *
+ * Deploy to any Node.js host (Railway, Fly.io, Vercel, AWS Lambda, etc.)
+ * and set BACKEND_BASE_URL in the mobile app's config.ts.
+ *
+ * Environment variables required (set via .env or secrets manager):
+ *   QF_CLIENT_ID      — your client_id (also needed in mobile app)
+ *   QF_CLIENT_SECRET  — ⚠️ NEVER put this in the mobile bundle
+ *   QF_REDIRECT_URI   — must match exactly what the app sends
+ *   QF_USE_PRELIVE    — "true" for pre-live, omit/false for production
+ *   PORT              — optional, defaults to 3001
+ */
 
-require('dotenv').config();
-const express  = require('express');
-const axios    = require('axios');
-const cors     = require('cors');
-const rateLimit = require('express-rate-limit');
+const express = require("express");
+const axios = require("axios");
+require("dotenv").config();
 
 const app = express();
-
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN, methods: ['GET', 'POST'] }));
 app.use(express.json());
 
-const CLIENT_ID    = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
-const USE_PRELIVE  = process.env.USE_PRELIVE === 'true';
-const AUTH_BASE    = USE_PRELIVE
-  ? 'https://prelive-oauth2.quran.foundation'
-  : 'https://oauth2.quran.foundation';
-const API_BASE     = USE_PRELIVE
-  ? 'https://apis-prelive.quran.foundation'
-  : 'https://apis.quran.foundation';
+// ─── Config ───────────────────────────────────────────────────────────────────
 
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 });
-const basicAuth   = { username: CLIENT_ID, password: CLIENT_SECRET };
+const {
+  QF_CLIENT_ID,
+  QF_CLIENT_SECRET,
+  QF_REDIRECT_URI,
+  QF_USE_PRELIVE,
+  PORT = 3001,
+} = process.env;
 
-// ── Step 1: QF redirects here, forward code to app ───────────
-app.get('/oauth/callback', (req, res) => {
-  const { code, state, error } = req.query;
-  console.log('📥 Callback received. code:', !!code, 'state:', !!state);
-
-  if (error) {
-    return res.redirect(`furkan://auth/callback?error=${encodeURIComponent(error)}`);
-  }
-  if (!code || !state) {
-    return res.status(400).send('Missing code or state');
-  }
-
-  res.redirect(
-    `furkan://Index?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`
+if (!QF_CLIENT_ID || !QF_CLIENT_SECRET || !QF_REDIRECT_URI) {
+  console.error(
+    "❌ Missing required env vars: QF_CLIENT_ID, QF_CLIENT_SECRET, QF_REDIRECT_URI"
   );
-});
+  process.exit(1);
+}
 
-// ── Step 2: Exchange auth code for tokens ─────────────────────
-app.post('/api/auth/qf/exchange', authLimiter, async (req, res) => {
+const AUTH_BASE =
+  QF_USE_PRELIVE === "true"
+    ? "https://prelive-oauth2.quran.foundation"
+    : "https://oauth2.quran.foundation";
+
+const TOKEN_URL = `${AUTH_BASE}/oauth2/token`;
+const REVOKE_URL = `${AUTH_BASE}/oauth2/revoke`;
+
+/**
+ * Basic Auth header for confidential client token requests.
+ * This is how Hydra (QF's auth server) authenticates confidential clients.
+ * See: https://api-docs.quran.foundation/docs/tutorials/oidc/getting-started-with-oauth2/
+ */
+function basicAuth() {
+  return Buffer.from(`${QF_CLIENT_ID}:${QF_CLIENT_SECRET}`).toString("base64");
+}
+
+// ─── POST /api/auth/qf/exchange ───────────────────────────────────────────────
+// Receives: { code, codeVerifier, redirectUri }
+// Returns:  { accessToken, refreshToken, idToken, expiresIn, user? }
+
+app.post("/api/auth/qf/exchange", async (req, res) => {
   const { code, codeVerifier, redirectUri } = req.body;
 
-  if (
-    typeof code !== 'string'         || code.length > 512 ||
-    typeof codeVerifier !== 'string' || codeVerifier.length > 128 ||
-    typeof redirectUri !== 'string'  || !redirectUri.startsWith('furkan://')
-  ) {
-    return res.status(400).json({ error: 'Invalid input' });
+  if (!code || !codeVerifier || !redirectUri) {
+    return res.status(400).json({ error: "code, codeVerifier, and redirectUri are required" });
   }
 
   try {
     const params = new URLSearchParams({
-      grant_type:    'authorization_code',
+      grant_type: "authorization_code",
       code,
-      redirect_uri:  redirectUri,
       code_verifier: codeVerifier,
+      redirect_uri: redirectUri,
+      client_id: QF_CLIENT_ID,
     });
 
-    const { data } = await axios.post(
-      `${AUTH_BASE}/oauth2/token`,
-      params.toString(),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, auth: basicAuth }
-    );
-
-    console.log('✅ Token exchange success');
-    res.json({
-      access_token:  data.access_token,
-      refresh_token: data.refresh_token,
-      id_token:      data.id_token,
-      expires_in:    data.expires_in,
-    });
-  } catch (err) {
-    console.error('❌ Exchange error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Token exchange failed', detail: err.response?.data });
-  }
-});
-
-// ── Step 3: Refresh expired access token ──────────────────────
-app.post('/api/auth/qf/refresh', authLimiter, async (req, res) => {
-  const { refreshToken } = req.body;
-
-  if (typeof refreshToken !== 'string' || refreshToken.length > 512) {
-    return res.status(400).json({ error: 'Invalid refreshToken' });
-  }
-
-  try {
-    const params = new URLSearchParams({
-      grant_type:    'refresh_token',
-      refresh_token: refreshToken,
-    });
-
-    const { data } = await axios.post(
-      `${AUTH_BASE}/oauth2/token`,
-      params.toString(),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, auth: basicAuth }
-    );
-
-    res.json({
-      access_token:  data.access_token,
-      refresh_token: data.refresh_token,
-      expires_in:    data.expires_in,
-    });
-  } catch (err) {
-    console.error('❌ Refresh error:', err.response?.data || err.message);
-    res.status(401).json({ error: 'Token refresh failed — user must re-login' });
-  }
-});
-
-// ── Step 4: Proxy QF User API calls ───────────────────────────
-app.all('/api/qf/*path', async (req, res) => {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader?.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'No token provided' });
-  }
-
-  const accessToken = authHeader.split(' ')[1];
-  const qfPath = '/' + req.params.path;  // ← use params.path instead of req.path
-
-  try {
-    const { data, status } = await axios({
-      method: req.method,
-      url:    `${API_BASE}/auth/v1${qfPath}`,
-      params: req.query,
-      data:   req.method !== 'GET' ? req.body : undefined,
+    const { data } = await axios.post(TOKEN_URL, params.toString(), {
       headers: {
-        'x-auth-token': accessToken,
-        'x-client-id':  CLIENT_ID,
-        'Content-Type': 'application/json',
+        "Content-Type": "application/x-www-form-urlencoded",
+        // Confidential client: authenticate with HTTP Basic Auth
+        Authorization: `Basic ${basicAuth()}`,
       },
     });
-    res.status(status).json(data);
+
+    return res.json({
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token,
+      idToken: data.id_token,
+      expiresIn: data.expires_in,
+      // Optionally decode id_token and return user info so the app
+      // doesn't need to decode a JWT itself:
+      // user: decodeIdToken(data.id_token),
+    });
   } catch (err) {
-    res.status(err.response?.status ?? 500).json(
-      err.response?.data ?? { error: 'Proxy error' }
-    );
+    const status = err.response?.status ?? 500;
+    const qfError = err.response?.data ?? {};
+    console.error("Token exchange failed:", qfError);
+    return res.status(status).json({
+      error: qfError.error_description ?? qfError.error ?? "Token exchange failed",
+    });
   }
 });
 
-// ── Utility routes ────────────────────────────────────────────
-app.get('/health', (req, res) =>
-  res.json({ status: 'ok', env: USE_PRELIVE ? 'prelive' : 'production' })
-);
-app.get('/', (req, res) => res.send('Quran Auth Backend ✅'));
+// ─── POST /api/auth/qf/refresh ────────────────────────────────────────────────
+// Receives: { refreshToken }
+// Returns:  { accessToken, refreshToken, idToken, expiresIn }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.post("/api/auth/qf/refresh", async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) {
+    return res.status(400).json({ error: "refreshToken is required" });
+  }
+
+  try {
+    const params = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: QF_CLIENT_ID,
+    });
+
+    const { data } = await axios.post(TOKEN_URL, params.toString(), {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${basicAuth()}`,
+      },
+    });
+
+    return res.json({
+      accessToken: data.access_token,
+      refreshToken: data.refresh_token ?? refreshToken, // QF may rotate it
+      idToken: data.id_token,
+      expiresIn: data.expires_in,
+    });
+  } catch (err) {
+    const status = err.response?.status ?? 500;
+    const qfError = err.response?.data ?? {};
+    console.error("Token refresh failed:", qfError);
+    return res.status(status).json({
+      error: qfError.error_description ?? qfError.error ?? "Token refresh failed",
+    });
+  }
+});
+
+// ─── POST /api/auth/qf/logout ─────────────────────────────────────────────────
+// Receives: { refreshToken }
+// Revokes the refresh token at the QF authorization server.
+
+app.post("/api/auth/qf/logout", async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) return res.status(200).json({ ok: true }); // already logged out
+
+  try {
+    const params = new URLSearchParams({
+      token: refreshToken,
+      token_type_hint: "refresh_token",
+      client_id: QF_CLIENT_ID,
+    });
+
+    await axios.post(REVOKE_URL, params.toString(), {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${basicAuth()}`,
+      },
+    });
+  } catch (err) {
+    // Revocation failures are best-effort; still return success to the app
+    console.warn("Token revocation failed (best-effort):", err.response?.data);
+  }
+
+  return res.json({ ok: true });
+});
+
+// ─── Health check ─────────────────────────────────────────────────────────────
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.listen(PORT, () => {
+  console.log(`✅ QF OAuth2 backend running on port ${PORT}`);
+  console.log(`   Auth base: ${AUTH_BASE}`);
+  console.log(`   Redirect:  ${QF_REDIRECT_URI}`);
+});
