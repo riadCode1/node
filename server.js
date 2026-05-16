@@ -3,15 +3,13 @@
  *
  * This server keeps CLIENT_SECRET off the mobile device.
  * It performs:
+ *   GET  /oauth/callback        — bridge: forwards QF redirect → furkan:// deep link
  *   POST /api/auth/qf/exchange  — code + code_verifier → tokens
  *   POST /api/auth/qf/refresh   — refresh_token → new tokens
  *   POST /api/auth/qf/logout    — revoke refresh_token
  *
- * Deploy to any Node.js host (Railway, Fly.io, Vercel, AWS Lambda, etc.)
- * and set BACKEND_BASE_URL in the mobile app's config.ts.
- *
- * Environment variables required (set via .env or secrets manager):
- *   QF_CLIENT_ID      — your client_id (also needed in mobile app)
+ * Environment variables required:
+ *   QF_CLIENT_ID      — your client_id
  *   QF_CLIENT_SECRET  — ⚠️ NEVER put this in the mobile bundle
  *   QF_REDIRECT_URI   — must match exactly what the app sends
  *   QF_USE_PRELIVE    — "true" for pre-live, omit/false for production
@@ -50,18 +48,35 @@ const AUTH_BASE =
 const TOKEN_URL = `${AUTH_BASE}/oauth2/token`;
 const REVOKE_URL = `${AUTH_BASE}/oauth2/revoke`;
 
-/**
- * Basic Auth header for confidential client token requests.
- * This is how Hydra (QF's auth server) authenticates confidential clients.
- * See: https://api-docs.quran.foundation/docs/tutorials/oidc/getting-started-with-oauth2/
- */
 function basicAuth() {
   return Buffer.from(`${QF_CLIENT_ID}:${QF_CLIENT_SECRET}`).toString("base64");
 }
 
+// ─── OAuth2 callback bridge ───────────────────────────────────────────────────
+// QF redirects here because your backend URL is registered as the redirect URI.
+// This immediately forwards the code into the mobile app via deep link.
+// ⚠️ Temporary — delete once QF updates your registered URI to furkan://oauth/callback
+
+app.get("/oauth/callback", (req, res) => {
+  const { code, state, error, error_description } = req.query;
+
+  if (error) {
+    console.error("OAuth error from QF:", error, error_description);
+    return res.redirect(
+      `furkan://oauth/callback?error=${encodeURIComponent(error)}&error_description=${encodeURIComponent(error_description ?? "")}`
+    );
+  }
+
+  if (!code) {
+    return res.status(400).send("Missing code parameter");
+  }
+
+  const appUri = `furkan://oauth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state ?? "")}`;
+  console.log("✅ Bridging OAuth callback to app:", appUri);
+  res.redirect(appUri);
+});
+
 // ─── POST /api/auth/qf/exchange ───────────────────────────────────────────────
-// Receives: { code, codeVerifier, redirectUri }
-// Returns:  { accessToken, refreshToken, idToken, expiresIn, user? }
 
 app.post("/api/auth/qf/exchange", async (req, res) => {
   const { code, codeVerifier, redirectUri } = req.body;
@@ -82,7 +97,6 @@ app.post("/api/auth/qf/exchange", async (req, res) => {
     const { data } = await axios.post(TOKEN_URL, params.toString(), {
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
-        // Confidential client: authenticate with HTTP Basic Auth
         Authorization: `Basic ${basicAuth()}`,
       },
     });
@@ -92,9 +106,6 @@ app.post("/api/auth/qf/exchange", async (req, res) => {
       refreshToken: data.refresh_token,
       idToken: data.id_token,
       expiresIn: data.expires_in,
-      // Optionally decode id_token and return user info so the app
-      // doesn't need to decode a JWT itself:
-      // user: decodeIdToken(data.id_token),
     });
   } catch (err) {
     const status = err.response?.status ?? 500;
@@ -107,8 +118,6 @@ app.post("/api/auth/qf/exchange", async (req, res) => {
 });
 
 // ─── POST /api/auth/qf/refresh ────────────────────────────────────────────────
-// Receives: { refreshToken }
-// Returns:  { accessToken, refreshToken, idToken, expiresIn }
 
 app.post("/api/auth/qf/refresh", async (req, res) => {
   const { refreshToken } = req.body;
@@ -132,7 +141,7 @@ app.post("/api/auth/qf/refresh", async (req, res) => {
 
     return res.json({
       accessToken: data.access_token,
-      refreshToken: data.refresh_token ?? refreshToken, // QF may rotate it
+      refreshToken: data.refresh_token ?? refreshToken,
       idToken: data.id_token,
       expiresIn: data.expires_in,
     });
@@ -147,12 +156,10 @@ app.post("/api/auth/qf/refresh", async (req, res) => {
 });
 
 // ─── POST /api/auth/qf/logout ─────────────────────────────────────────────────
-// Receives: { refreshToken }
-// Revokes the refresh token at the QF authorization server.
 
 app.post("/api/auth/qf/logout", async (req, res) => {
   const { refreshToken } = req.body;
-  if (!refreshToken) return res.status(200).json({ ok: true }); // already logged out
+  if (!refreshToken) return res.status(200).json({ ok: true });
 
   try {
     const params = new URLSearchParams({
@@ -168,7 +175,6 @@ app.post("/api/auth/qf/logout", async (req, res) => {
       },
     });
   } catch (err) {
-    // Revocation failures are best-effort; still return success to the app
     console.warn("Token revocation failed (best-effort):", err.response?.data);
   }
 
