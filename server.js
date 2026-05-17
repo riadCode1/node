@@ -76,7 +76,10 @@ app.post("/api/auth/qf/exchange", async (req, res) => {
     });
 
     // Decode id_token so the mobile app gets user info without parsing a JWT
-    const user = data.id_token ? jwt.decode(data.id_token) : null;
+   const user =
+  data.id_token && typeof data.id_token === "string" && data.id_token.length > 10
+    ? jwt.decode(data.id_token)
+    : null;
 
     return res.json({
       accessToken: data.access_token,
