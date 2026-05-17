@@ -33,7 +33,7 @@ const {
   PORT = 3001,
 } = process.env;
 
-if (!QF_CLIENT_ID || !QF_CLIENT_SECRET || !QF_REDIRECT_URI) {
+if (!QF_CLIENT_ID || !QF_CLIENT_SECRET || !"https://node-1-41dg.onrender.com/oauth/callback") {
   console.error(
     "❌ Missing required env vars: QF_CLIENT_ID, QF_CLIENT_SECRET, QF_REDIRECT_URI"
   );
@@ -175,5 +175,5 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.listen(PORT, () => {
   console.log(`✅ QF OAuth2 backend running on port ${PORT}`);
   console.log(`   Auth base: ${AUTH_BASE}`);
-  console.log(`   Redirect:  ${QF_REDIRECT_URI}`);
+  console.log(`   Redirect:  ${"https://node-1-41dg.onrender.com/oauth/callback"}`);
 });
